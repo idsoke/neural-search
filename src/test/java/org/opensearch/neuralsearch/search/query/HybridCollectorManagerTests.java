@@ -267,6 +267,92 @@ public class HybridCollectorManagerTests extends OpenSearchQueryTestCase {
     }
 
     @SneakyThrows
+    public void testReduce_whenManyMatchedDocsAndSmallSize_thenTotalHitsIsAccurate() {
+        // Regression test for https://github.com/opensearch-project/OpenSearch/issues/22823:
+        // hybrid query under-reported hits.total.value when the requested size was small relative
+        // to the number of actual matches. The bug was that the top-k heap (sized to the small
+        // requested "size") fed its eviction score back into the bulk scorer's min-competitive-score
+        // pruning as soon as it filled up, long before enough hits had been seen to satisfy
+        // track_total_hits' accuracy threshold, causing later documents to be dropped without ever
+        // being counted.
+        SearchContext searchContext = mock(SearchContext.class);
+        QueryShardContext mockQueryShardContext = mock(QueryShardContext.class);
+        TextFieldMapper.TextFieldType fieldType = (TextFieldMapper.TextFieldType) createMapperService().fieldType(TEXT_FIELD_NAME);
+        when(mockQueryShardContext.fieldMapper(eq(TEXT_FIELD_NAME))).thenReturn(fieldType);
+        HybridQueryContext hybridQueryContext = HybridQueryContext.builder().paginationDepth(10).build();
+
+        MapperService mapperService = createMapperService();
+        when(searchContext.mapperService()).thenReturn(mapperService);
+
+        final String matchAllTerm = "term";
+        HybridQuery hybridQueryWithTerm = new HybridQuery(
+            List.of(QueryBuilders.termQuery(TEXT_FIELD_NAME, matchAllTerm).toQuery(mockQueryShardContext)),
+            hybridQueryContext
+        );
+        when(searchContext.query()).thenReturn(hybridQueryWithTerm);
+
+        // Use enough matching documents to span multiple of the bulk scorer's internal scoring
+        // windows (4096 docs each), and vary term frequency (and therefore score) per document so
+        // that a premature min-competitive-score cutoff would exclude many of them.
+        final int numMatchingDocs = 5000;
+        final int requestedSize = 5;
+
+        Directory directory = newDirectory();
+        final IndexWriter w = new IndexWriter(directory, newIndexWriterConfig());
+        FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
+        ft.freeze();
+
+        for (int i = 0; i < numMatchingDocs; i++) {
+            int termFrequency = (i % 50) + 1;
+            String fieldValue = String.join(" ", Collections.nCopies(termFrequency, matchAllTerm));
+            w.addDocument(getDocument(TEXT_FIELD_NAME, RandomizedTest.randomInt(), fieldValue, ft));
+        }
+        // Force a single segment so the whole corpus is scored in one BulkScorer#score call.
+        w.forceMerge(1);
+        w.commit();
+
+        IndexReader reader = DirectoryReader.open(w);
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        ContextIndexSearcher indexSearcher = mock(ContextIndexSearcher.class);
+        when(indexSearcher.getIndexReader()).thenReturn(reader);
+        when(searchContext.searcher()).thenReturn(indexSearcher);
+        when(searchContext.size()).thenReturn(requestedSize);
+        when(searchContext.trackTotalHitsUpTo()).thenReturn(10_000);
+
+        Map<Class<?>, CollectorManager<? extends Collector, ReduceableSearchResult>> classCollectorManagerMap = new HashMap<>();
+        when(searchContext.queryCollectorManagers()).thenReturn(classCollectorManagerMap);
+        when(searchContext.shouldUseConcurrentSearch()).thenReturn(false);
+
+        CollectorManager hybridCollectorManager = HybridCollectorManager.createHybridCollectorManager(searchContext, hybridQueryWithTerm);
+        HybridTopScoreDocCollector collector = (HybridTopScoreDocCollector) hybridCollectorManager.newCollector();
+
+        Weight weight = new HybridQueryWeight(hybridQueryWithTerm, searcher, ScoreMode.TOP_SCORES, BoostingQueryBuilder.DEFAULT_BOOST);
+        collector.setWeight(weight);
+        LeafReaderContext leafReaderContext = searcher.getIndexReader().leaves().get(0);
+        LeafCollector leafCollector = collector.getLeafCollector(leafReaderContext);
+        BulkScorer scorer = weight.bulkScorer(leafReaderContext);
+        scorer.score(leafCollector, leafReaderContext.reader().getLiveDocs(), 0, DocIdSetIterator.NO_MORE_DOCS);
+        leafCollector.finish();
+
+        Object results = hybridCollectorManager.reduce(List.of(collector));
+
+        assertNotNull(results);
+        ReduceableSearchResult reduceableSearchResult = ((ReduceableSearchResult) results);
+        QuerySearchResult querySearchResult = new QuerySearchResult();
+        reduceableSearchResult.reduce(querySearchResult);
+        TopDocsAndMaxScore topDocsAndMaxScore = querySearchResult.topDocs();
+
+        assertNotNull(topDocsAndMaxScore);
+        assertEquals(numMatchingDocs, topDocsAndMaxScore.topDocs.totalHits.value());
+        assertEquals(TotalHits.Relation.EQUAL_TO, topDocsAndMaxScore.topDocs.totalHits.relation());
+
+        w.close();
+        reader.close();
+        directory.close();
+    }
+
+    @SneakyThrows
     public void testNewCollector_whenNotConcurrentSearchAndSortingIsApplied_thenSuccessful() {
         SearchContext searchContext = mock(SearchContext.class);
         SortField sortField = new SortField("_doc", SortField.Type.DOC);

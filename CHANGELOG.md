@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * [Sparse ANN] Fold sparse vector tokens into the signed-short range (modulus 32768) so folded tokens are never sign-extended to a negative value when stored in short[] ([#1926](https://github.com/opensearch-project/neural-search/pull/1926))
 * [Hybrid Query] Read the current document and its sub-query matches from the positioned disjunction iterator, fixing an ArrayIndexOutOfBoundsException and silently misattributed scores when a sub-query has a two-phase iterator ([#1946](https://github.com/opensearch-project/neural-search/issues/1946))
 * [RRF] Reject a combination technique other than rrf when creating a score-ranker-processor, instead of accepting the pipeline and throwing NullPointerException on every query ([#1949](https://github.com/opensearch-project/neural-search/pull/1949))
+* [Hybrid Query] Fix inaccurate hits.total.value on hybrid queries with a small size, caused by top-k heap eviction feeding min-competitive-score pruning before track_total_hits' threshold was reached ([opensearch-project/OpenSearch#22823](https://github.com/opensearch-project/OpenSearch/issues/22823))
 
 ### Infrastructure
 
